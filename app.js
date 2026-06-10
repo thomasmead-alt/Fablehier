@@ -3,11 +3,20 @@
  * Cost Centre Hierarchy Builder
  * Plain JavaScript, no libraries. All processing happens in the browser;
  * state is persisted to localStorage only.
+ *
+ * Data model:
+ *  - state.hier.target  : the to-be file exactly as uploaded (baseline, never edited)
+ *  - state.work         : editable working copy of the to-be hierarchy; the tree
+ *                         "live view" and the table view both render and edit it
+ *  - state.recs         : approval flow for missing cost centres
+ *                         ccKey -> {nodeId, status: 'approved'|'rejected', manual}
+ *  - CRUD exports diff state.work against state.hier.target
  */
 
 /* ============================================================ state */
 
-const STORAGE_KEY = 'cc-hier-builder.v1';
+const STORAGE_KEY = 'cc-hier-builder.v2';
+const STORAGE_KEY_V1 = 'cc-hier-builder.v1';
 
 const state = {
   ks13FileName: '',
@@ -22,7 +31,9 @@ const state = {
   hier: { current: null, target: null }, // {nodes, roots, warnings, format, fileName}
   hierFormatChoice: { current: 'auto', target: 'auto' },
   targetProjectId: null,
-  assignments: {},          // cost-centre normKey -> target group node id
+  work: null,               // editable working copy of the target tree
+  recs: {},                 // recommendation approval state per cost centre
+  editView: 'tree',         // 'tree' | 'table'
 };
 
 /* ============================================================ utilities */
@@ -64,6 +75,13 @@ function toCSV(rows) {
     const s = String(c == null ? '' : c);
     return /[",;\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }).join(',')).join('\r\n');
+}
+
+function deepCopyTree(t) {
+  if (!t) return null;
+  return JSON.parse(JSON.stringify({
+    nodes: t.nodes, roots: t.roots, format: t.format, fileName: t.fileName,
+  }));
 }
 
 /* ============================================================ file parsing */
@@ -173,8 +191,8 @@ function parseKS13(text) {
   let hi = all.findIndex(r => r.some(c => /cost\s*cent|kostenstelle/i.test(c)));
   if (hi < 0) hi = 0;
   const headers = all[hi];
-  const headerJoined = headers.join('');
-  const rows = all.slice(hi + 1).filter(r => r.join('') !== headerJoined);
+  const headerJoined = headers.join('');
+  const rows = all.slice(hi + 1).filter(r => r.join('') !== headerJoined);
   return { headers, rows, mapping: guessMapping(headers) };
 }
 
@@ -206,6 +224,7 @@ function rebuildCostCentres() {
   state.duplicates = duplicates;
   if (state.hier.current) classifyTree(state.hier.current, costCentres);
   if (state.hier.target) classifyTree(state.hier.target, costCentres);
+  if (state.work) classifyTree(state.work, costCentres);
 }
 
 /* ============================================================ hierarchy files */
@@ -357,7 +376,7 @@ function classifyTree(tree, costCentres) {
     if (costCentres[k] && !n.children.length) {
       n.type = 'cc';
       if (!n.name) n.name = costCentres[k].name;
-    } else if (n.children.length) {
+    } else if (n.children.length || n.manual) {
       n.type = 'group';
     } else {
       n.type = 'unknown';
@@ -379,6 +398,143 @@ function groupOptions(tree) {
   return out;
 }
 
+/* ============================================================ tree editing */
+
+/* Is `nodeId` inside the subtree rooted at `rootId`? (walks up the parents) */
+function isInSubtree(tree, rootId, nodeId) {
+  let cur = nodeId;
+  const seen = new Set();
+  while (cur) {
+    if (cur === rootId) return true;
+    if (seen.has(cur)) return false;
+    seen.add(cur);
+    cur = tree.nodes[cur] ? tree.nodes[cur].parent : null;
+  }
+  return false;
+}
+
+function detachNode(tree, id) {
+  const n = tree.nodes[id];
+  if (!n) return;
+  if (n.parent && tree.nodes[n.parent]) {
+    const arr = tree.nodes[n.parent].children;
+    const i = arr.indexOf(id);
+    if (i >= 0) arr.splice(i, 1);
+  } else {
+    const i = tree.roots.indexOf(id);
+    if (i >= 0) tree.roots.splice(i, 1);
+  }
+  n.parent = null;
+}
+
+/* Move a node under a new parent ('' / null = make it a root). */
+function moveNode(tree, id, newParentId) {
+  const n = tree.nodes[id];
+  if (!n) return { ok: false, error: 'Unknown node.' };
+  newParentId = newParentId || null;
+  if (newParentId === id) return { ok: false, error: 'Cannot move a node under itself.' };
+  if (newParentId) {
+    const p = tree.nodes[newParentId];
+    if (!p) return { ok: false, error: 'Unknown parent node.' };
+    if (p.type === 'cc') return { ok: false, error: 'Cannot place a node under a cost centre.' };
+    if (isInSubtree(tree, id, newParentId)) {
+      return { ok: false, error: `Cannot move "${n.label}" under its own descendant.` };
+    }
+  }
+  if ((n.parent || null) === newParentId) return { ok: true, noop: true };
+  detachNode(tree, id);
+  if (newParentId) {
+    n.parent = newParentId;
+    tree.nodes[newParentId].children.push(id);
+  } else {
+    tree.roots.push(id);
+  }
+  return { ok: true };
+}
+
+function renameNode(tree, id, name) {
+  const n = tree.nodes[id];
+  if (!n) return { ok: false, error: 'Unknown node.' };
+  n.name = String(name == null ? '' : name).trim();
+  return { ok: true };
+}
+
+/* Add a new (manual) group node under parentId, or as a root when parentId is empty. */
+function addGroup(tree, parentId, rawId, name) {
+  const id = String(rawId == null ? '' : rawId).trim();
+  if (!id) return { ok: false, error: 'A node ID is required.' };
+  const key = normKey(id);
+  if (tree.nodes[key]) return { ok: false, error: `A node "${id}" already exists in the hierarchy.` };
+  if (parentId && !tree.nodes[parentId]) return { ok: false, error: 'Unknown parent node.' };
+  tree.nodes[key] = {
+    id: key, label: id, name: String(name == null ? '' : name).trim(),
+    children: [], parent: parentId || null, type: 'group', manual: true,
+  };
+  if (parentId) tree.nodes[parentId].children.push(key);
+  else tree.roots.push(key);
+  return { ok: true, id: key };
+}
+
+/* Delete a group node; its children are promoted one level up. */
+function deleteNodePromote(tree, id) {
+  const n = tree.nodes[id];
+  if (!n) return { ok: false, error: 'Unknown node.' };
+  const parentId = n.parent || null;
+  const kids = [...n.children];
+  if (parentId && tree.nodes[parentId]) {
+    const arr = tree.nodes[parentId].children;
+    const i = arr.indexOf(id);
+    arr.splice(i >= 0 ? i : arr.length, 1, ...kids);
+  } else {
+    const i = tree.roots.indexOf(id);
+    tree.roots.splice(i >= 0 ? i : tree.roots.length, 1, ...kids);
+  }
+  for (const k of kids) if (tree.nodes[k]) tree.nodes[k].parent = parentId;
+  delete tree.nodes[id];
+  return { ok: true, promoted: kids };
+}
+
+/* Remove a cost centre node from the tree entirely. */
+function removeCCNode(tree, id) {
+  if (!tree.nodes[id]) return { ok: false, error: 'Unknown node.' };
+  detachNode(tree, id);
+  delete tree.nodes[id];
+  return { ok: true };
+}
+
+/* ============================================================ approval flow */
+
+/* Apply an approved recommendation: insert the cost centre into the working tree. */
+function approveRec(ccKey, nodeId, manual, s) {
+  s = s || state;
+  const cc = s.costCentres[ccKey];
+  if (!cc || !s.work || !s.work.nodes[nodeId] || s.work.nodes[ccKey]) {
+    return { ok: false, error: 'Cannot apply this placement.' };
+  }
+  s.work.nodes[ccKey] = {
+    id: ccKey, label: cc.id, name: cc.name, children: [], parent: nodeId, type: 'cc',
+  };
+  s.work.nodes[nodeId].children.push(ccKey);
+  s.recs[ccKey] = { nodeId, status: 'approved', manual: !!manual };
+  return { ok: true };
+}
+
+function undoApproval(ccKey, s) {
+  s = s || state;
+  if (s.work && s.work.nodes[ccKey]) removeCCNode(s.work, ccKey);
+  delete s.recs[ccKey];
+}
+
+function rejectRec(ccKey, s) {
+  s = s || state;
+  s.recs[ccKey] = { nodeId: null, status: 'rejected', manual: false };
+}
+
+function reconsiderRec(ccKey, s) {
+  s = s || state;
+  delete s.recs[ccKey];
+}
+
 /* ============================================================ completeness */
 
 function computeCheck(ctx) {
@@ -392,37 +548,42 @@ function computeCheck(ctx) {
   }
   projectCCs.sort((a, b) => a.id.localeCompare(b.id));
 
-  const target = s.hier.target;
+  const work = s.work;
+  const baseNodes = s.hier.target ? s.hier.target.nodes : {};
   const present = new Set();
-  const extras = [];        // cc keys in the target file that are not in the project
-  const unknownNodes = [];  // leaf node ids in the target file not found in KS13
-  if (target) {
-    for (const k in target.nodes) {
-      const n = target.nodes[k];
+  const extras = [];        // cc keys in the working tree that are not in the project
+  const unknownNodes = [];  // leaf node ids in the working tree not found in KS13
+  if (work) {
+    for (const k in work.nodes) {
+      const n = work.nodes[k];
       if (s.costCentres[k]) {
         present.add(k);
         if (!proj || s.pcProject[s.costCentres[k].pcKey] !== proj.id) extras.push(k);
-      } else if (!n.children.length) {
+      } else if (!n.children.length && !n.manual) {
         unknownNodes.push(k);
       }
     }
   }
-  const missing = projectCCs.filter(cc => !present.has(cc.key) && !s.assignments[cc.key]);
-  const assigned = projectCCs.filter(cc => !present.has(cc.key) && s.assignments[cc.key]);
-  const covered = projectCCs.filter(cc => present.has(cc.key));
-  return { proj, projectCCs, covered, missing, assigned, extras, unknownNodes };
+  const recs = s.recs || {};
+  const missingAll = projectCCs.filter(cc => !present.has(cc.key));
+  const missing = missingAll.filter(cc => !(recs[cc.key] && recs[cc.key].status === 'rejected'));
+  const rejected = missingAll.filter(cc => recs[cc.key] && recs[cc.key].status === 'rejected');
+  const covered = projectCCs.filter(cc => present.has(cc.key) && baseNodes[cc.key]);
+  const added = projectCCs.filter(cc => present.has(cc.key) && !baseNodes[cc.key]);
+  return { proj, projectCCs, covered, added, missing, rejected, extras, unknownNodes };
 }
 
 /*
- * Suggest target parent nodes for a missing cost centre. The hierarchy is
+ * Recommend target parent nodes for a missing cost centre. The hierarchy is
  * organisational, so the strongest signal is the person responsible: parents
  * holding cost centres of the same responsible score highest. The as-is
  * hierarchy adds a secondary signal: parents where the cost centre's former
- * neighbours ended up.
+ * neighbours ended up. Runs against the editable working tree, so approved
+ * placements reinforce later recommendations.
  */
 function computeSuggestions(ccKey, ctx) {
   const s = ctx || state;
-  const target = s.hier.target;
+  const target = s.work;
   if (!target) return [];
   const me = s.costCentres[ccKey];
   const resp = me ? normResp(me.responsible) : '';
@@ -443,12 +604,6 @@ function computeSuggestions(ccKey, ctx) {
       let p = n.parent ? target.nodes[n.parent].parent : null;
       while (p) { bump(p, 'anc'); p = target.nodes[p].parent; }
     }
-    // cost centres already assigned in this session count too
-    for (const k in s.assignments) {
-      if (k === ccKey) continue;
-      const info = s.costCentres[k];
-      if (info && normResp(info.responsible) === resp) bump(s.assignments[k], 'direct');
-    }
   }
 
   const current = s.hier.current;
@@ -457,7 +612,6 @@ function computeSuggestions(ccKey, ctx) {
       if (sib === ccKey) continue;
       const tn = target.nodes[sib];
       if (tn && tn.parent) bump(tn.parent, 'sib');
-      else if (s.assignments[sib]) bump(s.assignments[sib], 'sib');
     }
   }
 
@@ -478,6 +632,52 @@ function suggestionReason(c) {
   return parts.join(', ');
 }
 
+/* ============================================================ CRUD diff */
+
+/*
+ * Compare the working tree against the uploaded target file and list every
+ * change needed to turn the file into the edited hierarchy. Hierarchy nodes
+ * (CREATE / MOVE / RENAME / DELETE) and cost centres (ADD / MOVE / REMOVE)
+ * are reported separately.
+ */
+function diffChanges(baseline, work, costCentres) {
+  const bN = baseline ? baseline.nodes : {};
+  const wN = work ? work.nodes : {};
+  const parentLabel = (nodes, n) =>
+    n.parent ? (nodes[n.parent] ? nodes[n.parent].label : n.parent) : '(root)';
+  const nodeChanges = [], ccChanges = [];
+  const ids = new Set([...Object.keys(bN), ...Object.keys(wN)]);
+  for (const id of ids) {
+    const b = bN[id], w = wN[id];
+    const cc = costCentres[id];
+    if (cc) {
+      if (b && !w) ccChanges.push({ action: 'REMOVE', cc, oldParent: parentLabel(bN, b), newParent: '' });
+      else if (!b && w) ccChanges.push({ action: 'ADD', cc, oldParent: '', newParent: parentLabel(wN, w) });
+      else if (b && w && (b.parent || null) !== (w.parent || null)) {
+        ccChanges.push({ action: 'MOVE', cc, oldParent: parentLabel(bN, b), newParent: parentLabel(wN, w) });
+      }
+    } else if (b && !w) {
+      nodeChanges.push({ action: 'DELETE', id, label: b.label, oldName: b.name, newName: '', oldParent: parentLabel(bN, b), newParent: '' });
+    } else if (!b && w) {
+      nodeChanges.push({ action: 'CREATE', id, label: w.label, oldName: '', newName: w.name, oldParent: '', newParent: parentLabel(wN, w) });
+    } else if (b && w) {
+      const moved = (b.parent || null) !== (w.parent || null);
+      const renamed = (b.name || '') !== (w.name || '');
+      if (moved || renamed) {
+        nodeChanges.push({
+          action: moved && renamed ? 'MOVE+RENAME' : (moved ? 'MOVE' : 'RENAME'),
+          id, label: w.label, oldName: b.name, newName: w.name,
+          oldParent: parentLabel(bN, b), newParent: parentLabel(wN, w),
+        });
+      }
+    }
+  }
+  const order = { CREATE: 0, ADD: 0, 'MOVE+RENAME': 1, MOVE: 1, RENAME: 2, DELETE: 3, REMOVE: 3 };
+  nodeChanges.sort((a, b) => (order[a.action] - order[b.action]) || a.label.localeCompare(b.label));
+  ccChanges.sort((a, b) => (order[a.action] - order[b.action]) || a.cc.id.localeCompare(b.cc.id));
+  return { nodeChanges, ccChanges };
+}
+
 /* ============================================================ exports */
 
 function nodeDisplay(tree, id) {
@@ -485,48 +685,78 @@ function nodeDisplay(tree, id) {
   return n ? (n.label + (n.name ? ' — ' + n.name : '')) : id;
 }
 
+function addedSetOf() {
+  const out = new Set();
+  if (!state.work) return out;
+  const baseNodes = state.hier.target ? state.hier.target.nodes : {};
+  for (const k in state.work.nodes) if (!baseNodes[k]) out.add(k);
+  return out;
+}
+
+function exportNodeChanges() {
+  if (!state.work) return;
+  const { nodeChanges } = diffChanges(state.hier.target, state.work, state.costCentres);
+  if (!nodeChanges.length) { alert('No hierarchy node changes to export.'); return; }
+  const rows = [['Action', 'Node', 'Name', 'Old Name', 'Old Parent', 'New Parent']];
+  for (const ch of nodeChanges) {
+    rows.push([ch.action, ch.label, ch.newName, ch.oldName, ch.oldParent, ch.newParent]);
+  }
+  download('changes_nodes.csv', toCSV(rows));
+}
+
+function exportCCChanges() {
+  if (!state.work) return;
+  const { ccChanges } = diffChanges(state.hier.target, state.work, state.costCentres);
+  if (!ccChanges.length) { alert('No cost centre changes to export.'); return; }
+  const cur = state.hier.current;
+  const rows = [['Action', 'Cost Centre', 'Name', 'Person Responsible', 'Profit Centre',
+    'Old Parent', 'New Parent', 'As-is Parent', 'Source']];
+  for (const ch of ccChanges) {
+    const rec = state.recs[ch.cc.key];
+    let source = 'Editor';
+    if (ch.action === 'ADD' && rec && rec.status === 'approved') {
+      source = rec.manual ? 'Approved recommendation (manual placement)' : 'Approved recommendation';
+    }
+    const asIs = cur && cur.nodes[ch.cc.key] && cur.nodes[ch.cc.key].parent
+      ? nodeDisplay(cur, cur.nodes[ch.cc.key].parent) : '';
+    rows.push([ch.action, ch.cc.id, ch.cc.name, ch.cc.responsible, ch.cc.profitCentre,
+      ch.oldParent, ch.newParent, asIs, source]);
+  }
+  download('changes_cost_centres.csv', toCSV(rows));
+}
+
 function exportParentChild() {
-  const tree = state.hier.target;
+  const tree = state.work;
   if (!tree) return;
+  const added = addedSetOf();
   const rows = [['Parent', 'Child', 'Name', 'Type']];
-  const typeOf = n => n.type === 'cc' ? 'Cost Centre' : (n.type === 'group' ? 'Group' : 'Unknown');
   const walk = (id, parentLabel) => {
     const n = tree.nodes[id];
-    rows.push([parentLabel, n.label, n.name, typeOf(n)]);
+    const type = n.type === 'cc' ? 'Cost Centre' : 'Group';
+    rows.push([parentLabel, n.label, n.name, type + (added.has(id) ? ' (added)' : '')]);
     n.children.forEach(c => walk(c, n.label));
-    for (const ccKey in state.assignments) {
-      if (state.assignments[ccKey] === id) {
-        const cc = state.costCentres[ccKey];
-        if (cc) rows.push([n.label, cc.id, cc.name, 'Cost Centre (added)']);
-      }
-    }
   };
   tree.roots.forEach(r => walk(r, ''));
   download('hierarchy_parent_child.csv', toCSV(rows));
 }
 
 function exportLevels() {
-  const tree = state.hier.target;
+  const tree = state.work;
   if (!tree) return;
+  const added = addedSetOf();
   const flat = []; // {path:[labels], name, responsible, note}
   const walk = (id, path) => {
     const n = tree.nodes[id];
     const p = path.concat(n.label);
-    flat.push({ path: p, name: n.name, responsible: '', note: '' });
+    const cc = state.costCentres[id];
+    flat.push({
+      path: p, name: n.name,
+      responsible: cc ? cc.responsible : '',
+      note: added.has(id) ? 'added' : '',
+    });
     n.children.forEach(c => walk(c, p));
-    for (const ccKey in state.assignments) {
-      if (state.assignments[ccKey] === id) {
-        const cc = state.costCentres[ccKey];
-        if (cc) flat.push({ path: p.concat(cc.id), name: cc.name, responsible: cc.responsible, note: 'added' });
-      }
-    }
   };
   tree.roots.forEach(r => walk(r, []));
-  // fill responsible for cost-centre rows from KS13
-  for (const f of flat) {
-    const cc = state.costCentres[normKey(f.path[f.path.length - 1])];
-    if (cc && !f.responsible) f.responsible = cc.responsible;
-  }
   const depth = Math.max(...flat.map(f => f.path.length), 1);
   const header = [];
   for (let i = 1; i <= depth; i++) header.push('Level' + i);
@@ -542,20 +772,27 @@ function exportLevels() {
 
 function exportReport() {
   const chk = computeCheck();
-  const tree = state.hier.target;
+  const work = state.work;
   const rows = [['Status', 'Cost Centre', 'Name', 'Person Responsible', 'Profit Centre', 'Detail']];
+  const parentOf = key => work && work.nodes[key] && work.nodes[key].parent
+    ? nodeDisplay(work, work.nodes[key].parent) : '(root)';
   for (const cc of chk.missing) {
     const sug = computeSuggestions(cc.key)[0];
     rows.push(['MISSING', cc.id, cc.name, cc.responsible, cc.profitCentre,
-      sug ? 'Suggested parent: ' + nodeDisplay(tree, sug.id) : 'No suggestion']);
+      sug ? 'Recommended parent: ' + nodeDisplay(work, sug.id) : 'No recommendation']);
   }
-  for (const cc of chk.assigned) {
-    rows.push(['ASSIGNED', cc.id, cc.name, cc.responsible, cc.profitCentre,
-      'Assigned to: ' + nodeDisplay(tree, state.assignments[cc.key])]);
+  for (const cc of chk.rejected) {
+    rows.push(['REJECTED', cc.id, cc.name, cc.responsible, cc.profitCentre,
+      'Recommendation rejected — stays missing']);
+  }
+  for (const cc of chk.added) {
+    const rec = state.recs[cc.key];
+    rows.push(['ADDED', cc.id, cc.name, cc.responsible, cc.profitCentre,
+      'Placed under: ' + parentOf(cc.key) +
+      (rec && rec.status === 'approved' ? (rec.manual ? ' (manual placement)' : ' (approved recommendation)') : ' (editor)')]);
   }
   for (const cc of chk.covered) {
-    rows.push(['OK', cc.id, cc.name, cc.responsible, cc.profitCentre,
-      'Parent: ' + (tree.nodes[cc.key].parent ? nodeDisplay(tree, tree.nodes[cc.key].parent) : '(root)')]);
+    rows.push(['OK', cc.id, cc.name, cc.responsible, cc.profitCentre, 'Parent: ' + parentOf(cc.key)]);
   }
   for (const k of chk.extras) {
     const cc = state.costCentres[k];
@@ -564,7 +801,7 @@ function exportReport() {
       pn ? 'Belongs to project: ' + pn.name : 'Profit centre not assigned to any project']);
   }
   for (const k of chk.unknownNodes) {
-    rows.push(['UNKNOWN', tree.nodes[k].label, tree.nodes[k].name, '', '',
+    rows.push(['UNKNOWN', work.nodes[k].label, work.nodes[k].name, '', '',
       'Leaf in target file but not found in KS13']);
   }
   download('completeness_report.csv', toCSV(rows));
@@ -580,17 +817,30 @@ function scheduleSave() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       const ind = $('#saveIndicator');
-      if (ind) {
-        ind.textContent = 'Saved locally ' + new Date().toLocaleTimeString();
-      }
+      if (ind) ind.textContent = 'Saved locally ' + new Date().toLocaleTimeString();
     } catch (e) { /* storage full or unavailable — app still works in-memory */ }
   }, 400);
 }
 
 function loadSaved() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
+    let raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      raw = localStorage.getItem(STORAGE_KEY_V1);
+      if (!raw) return;
+      // migrate v1: direct assignments become approved recommendations
+      const old = JSON.parse(raw);
+      for (const k of Object.keys(state)) if (old[k] !== undefined) state[k] = old[k];
+      state.work = deepCopyTree(state.hier.target);
+      state.recs = {};
+      if (state.work && old.assignments) {
+        for (const ccKey in old.assignments) {
+          approveRec(ccKey, old.assignments[ccKey], false);
+        }
+      }
+      localStorage.removeItem(STORAGE_KEY_V1);
+      return;
+    }
     const saved = JSON.parse(raw);
     for (const k of Object.keys(state)) {
       if (saved[k] !== undefined) state[k] = saved[k];
@@ -611,6 +861,7 @@ function renderAll() {
   renderHier('current');
   renderHier('target');
   renderCheck();
+  renderEditor();
 }
 
 /* ---------- KS13 tab ---------- */
@@ -731,7 +982,7 @@ function renderProjects() {
   }));
 }
 
-/* ---------- Hierarchy tab ---------- */
+/* ---------- Hierarchy tab (read-only views of the uploaded files) ---------- */
 
 function ccCountUnder(tree, id, memo) {
   if (memo[id] !== undefined) return memo[id];
@@ -742,55 +993,33 @@ function ccCountUnder(tree, id, memo) {
   return c;
 }
 
-function renderTree(container, tree, opts) {
+function renderTree(container, tree) {
   container.innerHTML = '';
   if (!tree) { container.innerHTML = '<p class="muted">No file loaded.</p>'; return; }
-  opts = opts || {};
   const memo = {};
-  const extraSet = opts.extraSet || new Set();
-  const assignsByNode = {};
-  if (opts.assignments) {
-    for (const ccKey in opts.assignments) {
-      (assignsByNode[opts.assignments[ccKey]] = assignsByNode[opts.assignments[ccKey]] || []).push(ccKey);
-    }
-  }
-
-  const renderCCBits = (id, label, name, responsible, classes) => {
-    const div = document.createElement('div');
-    div.className = 'node ' + classes;
-    div.innerHTML = `<span class="caret leaf">▾</span><span class="nid">${esc(label)}</span>` +
-      (name ? `<span class="nname">${esc(name)}</span>` : '') +
-      (responsible ? `<span class="nresp">${esc(responsible)}</span>` : '');
-    return div;
-  };
 
   const renderNode = id => {
     const n = tree.nodes[id];
     const li = document.createElement('li');
-    const added = assignsByNode[id] || [];
-    if (n.type === 'cc' || (n.type === 'unknown' && !added.length)) {
+    if (!n.children.length) {
       const cc = state.costCentres[id];
-      let cls = n.type;
-      if (extraSet.has(id)) cls += ' extra';
-      li.appendChild(renderCCBits(id, n.label, n.name, cc ? cc.responsible : '', cls));
+      const div = document.createElement('div');
+      div.className = 'node ' + n.type;
+      div.innerHTML = `<span class="caret leaf">▾</span><span class="nid">${esc(n.label)}</span>` +
+        (n.name ? `<span class="nname">${esc(n.name)}</span>` : '') +
+        (cc && cc.responsible ? `<span class="nresp">${esc(cc.responsible)}</span>` : '');
+      li.appendChild(div);
       return li;
     }
     const row = document.createElement('div');
     row.className = 'node ' + n.type;
-    const ccTotal = ccCountUnder(tree, id, memo) + added.length;
     row.innerHTML = `<span class="caret">▾</span><span class="nid">${esc(n.label)}</span>` +
       (n.name ? `<span class="nname">${esc(n.name)}</span>` : '') +
-      `<span class="ncount">(${ccTotal} cc)</span>`;
+      `<span class="ncount">(${ccCountUnder(tree, id, memo)} cc)</span>`;
     row.querySelector('.caret').addEventListener('click', () => li.classList.toggle('collapsed'));
     li.appendChild(row);
     const ul = document.createElement('ul');
     n.children.forEach(c => ul.appendChild(renderNode(c)));
-    for (const ccKey of added) {
-      const cc = state.costCentres[ccKey];
-      const liA = document.createElement('li');
-      liA.appendChild(renderCCBits(ccKey, cc ? cc.id : ccKey, cc ? cc.name : '', cc ? cc.responsible : '', 'cc added'));
-      ul.appendChild(liA);
-    }
     li.appendChild(ul);
     return li;
   };
@@ -819,7 +1048,7 @@ function renderHier(slot) {
   renderTree(treeEl, tree);
 }
 
-/* ---------- Check tab ---------- */
+/* ---------- Check & approvals tab ---------- */
 
 function renderCheck() {
   // project select
@@ -828,12 +1057,12 @@ function renderCheck() {
     state.projects.map(p => `<option value="${p.id}" ${p.id === state.targetProjectId ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
 
   const hint = $('#checkHint');
-  const cards = ['#missingCard', '#assignedCard', '#extraCard', '#updatedCard', '#compareCard'];
+  const cards = ['#missingCard', '#approvedCard', '#rejectedCard', '#extraCard', '#compareCard'];
 
   const problems = [];
   if (!Object.keys(state.costCentres).length) problems.push('upload a KS13 file (tab 1)');
   if (!state.projects.length) problems.push('create a project and assign profit centres (tab 2)');
-  if (!state.hier.target) problems.push('upload a target (to-be) hierarchy file (tab 3)');
+  if (!state.work) problems.push('upload a target (to-be) hierarchy file (tab 3)');
   if (!problems.length && !state.targetProjectId) problems.push('choose above which project the target file represents');
   if (problems.length) {
     hint.textContent = 'To run the check: ' + problems.join('; ') + '.';
@@ -844,67 +1073,96 @@ function renderCheck() {
   hint.textContent = '';
 
   const chk = computeCheck();
-  const tree = state.hier.target;
+  const work = state.work;
 
   $('#checkSummary').innerHTML =
     `<span class="chip">${chk.projectCCs.length} cost centres in project</span>` +
     `<span class="chip green">${chk.covered.length} in target file</span>` +
-    (chk.assigned.length ? `<span class="chip green">${chk.assigned.length} assigned now</span>` : '') +
+    (chk.added.length ? `<span class="chip green">${chk.added.length} added</span>` : '') +
     (chk.missing.length
       ? `<span class="chip red">${chk.missing.length} missing</span>`
-      : `<span class="chip green">complete ✓</span>`) +
+      : (chk.rejected.length ? '' : '<span class="chip green">complete ✓</span>')) +
+    (chk.rejected.length ? `<span class="chip amber">${chk.rejected.length} rejected (stay missing)</span>` : '') +
     (chk.extras.length ? `<span class="chip amber">${chk.extras.length} not in this project</span>` : '') +
     (chk.unknownNodes.length ? `<span class="chip amber">${chk.unknownNodes.length} unknown entries</span>` : '');
 
-  /* missing table */
+  /* missing table with recommendation approval */
   $('#missingCard').hidden = chk.missing.length === 0;
   $('#missingCount').textContent = chk.missing.length;
   if (chk.missing.length) {
-    const groups = groupOptions(tree);
-    let html = '<thead><tr><th>Cost centre</th><th>Name</th><th>Person responsible</th><th>Profit centre</th><th>Suggestion</th><th>Assign to</th></tr></thead><tbody>';
+    const groups = groupOptions(work);
+    let html = '<thead><tr><th>Cost centre</th><th>Name</th><th>Person responsible</th><th>Profit centre</th><th>Recommendation</th><th>Place under</th><th>Decision</th></tr></thead><tbody>';
     for (const cc of chk.missing) {
       const sugs = computeSuggestions(cc.key);
       const top = sugs[0];
       const optHtml = groups.map(g =>
-        `<option value="${esc(g.id)}" ${top && g.id === top.id ? 'selected' : ''}>${'  '.repeat(g.depth)}${esc(g.label)}</option>`).join('');
+        `<option value="${esc(g.id)}" ${top && g.id === top.id ? 'selected' : ''}>${'\u00a0\u00a0'.repeat(g.depth)}${esc(g.label)}</option>`).join('');
       html += `<tr class="missing">
         <td class="mono">${esc(cc.id)}</td>
         <td>${esc(cc.name)}</td>
         <td>${esc(cc.responsible) || '<span class="muted">—</span>'}</td>
         <td class="mono">${esc(cc.profitCentre)}</td>
         <td class="suggestion">${top
-          ? `<strong>${esc(nodeDisplay(tree, top.id))}</strong><br><span class="why">${esc(suggestionReason(top))}</span>`
-          : '<span class="muted">no match for this person responsible</span>'}</td>
+          ? `<strong>${esc(nodeDisplay(work, top.id))}</strong><br><span class="why">${esc(suggestionReason(top))}</span>`
+          : '<span class="muted">no match for this person responsible — choose a parent manually</span>'}</td>
+        <td><select data-rec-sel="${esc(cc.key)}">${optHtml}</select></td>
         <td><div class="inline-form">
-          <select data-assign-sel="${esc(cc.key)}">${optHtml}</select>
-          <button class="small" data-assign="${esc(cc.key)}">Assign</button>
+          <button class="small" data-approve="${esc(cc.key)}" data-top="${top ? esc(top.id) : ''}">Approve</button>
+          <button class="small ghost danger" data-reject="${esc(cc.key)}">Reject</button>
         </div></td>
       </tr>`;
     }
     html += '</tbody>';
     $('#missingTable').innerHTML = html;
-    $('#missingTable').querySelectorAll('[data-assign]').forEach(btn => btn.addEventListener('click', () => {
-      const key = btn.dataset.assign;
-      const selEl = $('#missingTable').querySelector(`[data-assign-sel="${CSS.escape(key)}"]`);
-      if (selEl && selEl.value) {
-        state.assignments[key] = selEl.value;
-        changed();
-      }
+    $('#missingTable').querySelectorAll('[data-approve]').forEach(btn => btn.addEventListener('click', () => {
+      const key = btn.dataset.approve;
+      const selEl = $('#missingTable').querySelector(`[data-rec-sel="${CSS.escape(key)}"]`);
+      if (!selEl || !selEl.value) return;
+      const res = approveRec(key, selEl.value, selEl.value !== btn.dataset.top);
+      if (!res.ok) alert(res.error);
+      changed();
+    }));
+    $('#missingTable').querySelectorAll('[data-reject]').forEach(btn => btn.addEventListener('click', () => {
+      rejectRec(btn.dataset.reject);
+      changed();
     }));
   }
 
-  /* assigned table */
-  $('#assignedCard').hidden = chk.assigned.length === 0;
-  $('#assignedCount').textContent = chk.assigned.length;
-  if (chk.assigned.length) {
-    $('#assignedTable').innerHTML = '<thead><tr><th>Cost centre</th><th>Name</th><th>Person responsible</th><th>Assigned to</th><th></th></tr></thead><tbody>' +
-      chk.assigned.map(cc => `<tr>
-        <td class="mono">${esc(cc.id)}</td><td>${esc(cc.name)}</td><td>${esc(cc.responsible)}</td>
-        <td>${esc(nodeDisplay(tree, state.assignments[cc.key]))}</td>
-        <td><button class="small ghost danger" data-unassign="${esc(cc.key)}">Undo</button></td>
+  /* approved placements */
+  $('#approvedCard').hidden = chk.added.length === 0;
+  $('#approvedCount').textContent = chk.added.length;
+  if (chk.added.length) {
+    $('#approvedTable').innerHTML = '<thead><tr><th>Cost centre</th><th>Name</th><th>Person responsible</th><th>Placed under</th><th>Source</th><th></th></tr></thead><tbody>' +
+      chk.added.map(cc => {
+        const rec = state.recs[cc.key];
+        const parent = work.nodes[cc.key] && work.nodes[cc.key].parent
+          ? nodeDisplay(work, work.nodes[cc.key].parent) : '(root)';
+        const source = rec && rec.status === 'approved'
+          ? (rec.manual ? 'Manual placement (approved)' : 'Recommendation (approved)')
+          : 'Editor';
+        return `<tr>
+          <td class="mono">${esc(cc.id)}</td><td>${esc(cc.name)}</td><td>${esc(cc.responsible)}</td>
+          <td>${esc(parent)}</td><td>${esc(source)}</td>
+          <td><button class="small ghost danger" data-unapprove="${esc(cc.key)}">Undo</button></td>
+        </tr>`;
+      }).join('') + '</tbody>';
+    $('#approvedTable').querySelectorAll('[data-unapprove]').forEach(btn => btn.addEventListener('click', () => {
+      undoApproval(btn.dataset.unapprove);
+      changed();
+    }));
+  }
+
+  /* rejected recommendations */
+  $('#rejectedCard').hidden = chk.rejected.length === 0;
+  $('#rejectedCount').textContent = chk.rejected.length;
+  if (chk.rejected.length) {
+    $('#rejectedTable').innerHTML = '<thead><tr><th>Cost centre</th><th>Name</th><th>Person responsible</th><th>Profit centre</th><th></th></tr></thead><tbody>' +
+      chk.rejected.map(cc => `<tr>
+        <td class="mono">${esc(cc.id)}</td><td>${esc(cc.name)}</td><td>${esc(cc.responsible)}</td><td class="mono">${esc(cc.profitCentre)}</td>
+        <td><button class="small ghost" data-reconsider="${esc(cc.key)}">Reconsider</button></td>
       </tr>`).join('') + '</tbody>';
-    $('#assignedTable').querySelectorAll('[data-unassign]').forEach(btn => btn.addEventListener('click', () => {
-      delete state.assignments[btn.dataset.unassign];
+    $('#rejectedTable').querySelectorAll('[data-reconsider]').forEach(btn => btn.addEventListener('click', () => {
+      reconsiderRec(btn.dataset.reconsider);
       changed();
     }));
   }
@@ -915,7 +1173,7 @@ function renderCheck() {
   if (hasReview) {
     let html = '';
     if (chk.extras.length) {
-      html += '<p class="hint">Cost centres that are in the target file but do <strong>not</strong> belong to the selected project (check whether they were included on purpose):</p>';
+      html += '<p class="hint">Cost centres that are in the to-be hierarchy but do <strong>not</strong> belong to the selected project (check whether they were included on purpose):</p>';
       html += '<div class="table-wrap"><table><thead><tr><th>Cost centre</th><th>Name</th><th>Profit centre</th><th>Belongs to project</th></tr></thead><tbody>' +
         chk.extras.map(k => {
           const cc = state.costCentres[k];
@@ -924,23 +1182,17 @@ function renderCheck() {
         }).join('') + '</tbody></table></div>';
     }
     if (chk.unknownNodes.length) {
-      html += '<p class="hint">Leaf entries in the target file that were <strong>not found in the KS13 file</strong> (possible typos, retired cost centres, or empty groups):</p>' +
-        '<p class="mono">' + chk.unknownNodes.map(k => esc(state.hier.target.nodes[k].label)).join(', ') + '</p>';
+      html += '<p class="hint">Leaf entries in the to-be hierarchy that were <strong>not found in the KS13 file</strong> (possible typos, retired cost centres, or empty groups):</p>' +
+        '<p class="mono">' + chk.unknownNodes.map(k => esc(work.nodes[k].label)).join(', ') + '</p>';
     }
     $('#extraBody').innerHTML = html;
   }
-
-  /* updated tree + exports */
-  $('#updatedCard').hidden = false;
-  renderTree($('#updatedTree'), tree, {
-    assignments: state.assignments,
-    extraSet: new Set(chk.extras),
-  });
 
   /* comparison */
   const cur = state.hier.current;
   $('#compareCard').hidden = !cur;
   if (cur) {
+    const baseNodes = state.hier.target ? state.hier.target.nodes : {};
     const parentOf = (t, key) => {
       const n = t.nodes[key];
       if (!n) return null;
@@ -949,18 +1201,19 @@ function renderCheck() {
     let html = '<thead><tr><th>Cost centre</th><th>Name</th><th>Person responsible</th><th>As-is parent</th><th>To-be parent</th><th>Status</th></tr></thead><tbody>';
     for (const cc of chk.projectCCs) {
       const asIs = parentOf(cur, cc.key);
-      let toBe = parentOf(tree, cc.key);
+      const toBe = parentOf(work, cc.key);
       let status;
-      if (!toBe && state.assignments[cc.key]) {
-        toBe = nodeDisplay(tree, state.assignments[cc.key]);
-        status = '<span class="badge green">assigned</span>';
-      } else if (!toBe) {
-        status = '<span class="badge red">missing in to-be</span>';
+      if (!toBe) {
+        status = state.recs[cc.key] && state.recs[cc.key].status === 'rejected'
+          ? '<span class="badge grey">rejected — stays missing</span>'
+          : '<span class="badge red">missing in to-be</span>';
+      } else if (!baseNodes[cc.key]) {
+        status = '<span class="badge green">added</span>';
       } else if (!asIs) {
         status = '<span class="badge grey">not in as-is file</span>';
       } else {
-        const sameParent = cur.nodes[cc.key].parent && tree.nodes[cc.key].parent &&
-          cur.nodes[cc.key].parent === tree.nodes[cc.key].parent;
+        const sameParent = cur.nodes[cc.key].parent && work.nodes[cc.key].parent &&
+          cur.nodes[cc.key].parent === work.nodes[cc.key].parent;
         status = sameParent ? '<span class="badge grey">same parent</span>' : '<span class="badge green">moved</span>';
       }
       html += `<tr><td class="mono">${esc(cc.id)}</td><td>${esc(cc.name)}</td><td>${esc(cc.responsible)}</td>
@@ -969,6 +1222,212 @@ function renderCheck() {
     html += '</tbody>';
     $('#compareTable').innerHTML = html;
   }
+}
+
+/* ---------- Editor tab ---------- */
+
+let editMsgTimer = null;
+function editFlash(text, isError) {
+  const el = $('#editMsg');
+  el.textContent = text;
+  el.className = isError ? 'msg error' : 'msg';
+  clearTimeout(editMsgTimer);
+  if (text) editMsgTimer = setTimeout(() => { el.textContent = ''; }, 5000);
+}
+
+function promptNewGroup(parentId) {
+  const id = prompt('ID for the new group node:');
+  if (id === null) return;
+  const name = prompt('Name / description (optional):') || '';
+  const res = addGroup(state.work, parentId, id, name);
+  if (!res.ok) { editFlash(res.error, true); return; }
+  changed();
+}
+
+function deleteWorkNode(id) {
+  const work = state.work;
+  const n = work.nodes[id];
+  if (!n) return;
+  if (n.type === 'cc') {
+    if (!confirm(`Remove cost centre "${n.label}" from the hierarchy? It will return to the missing list.`)) return;
+    removeCCNode(work, id);
+    delete state.recs[id]; // back to a fresh recommendation
+  } else {
+    const kids = n.children.length;
+    if (!confirm(`Delete "${n.label}"?` + (kids ? ` Its ${kids} child node${kids > 1 ? 's' : ''} will move up one level.` : ''))) return;
+    deleteNodePromote(work, id);
+  }
+  changed();
+}
+
+function renderEditTree(container, work, addedSet, extraSet) {
+  container.innerHTML = '';
+  const memo = {};
+
+  const makeButtons = (id, isCC) => {
+    const span = document.createElement('span');
+    span.className = 'nbtns';
+    if (!isCC) {
+      const ren = document.createElement('button');
+      ren.className = 'nbtn'; ren.title = 'Rename'; ren.textContent = '✎';
+      ren.addEventListener('click', e => {
+        e.stopPropagation();
+        const nn = prompt(`New name for "${work.nodes[id].label}":`, work.nodes[id].name || '');
+        if (nn === null) return;
+        renameNode(work, id, nn);
+        changed();
+      });
+      const add = document.createElement('button');
+      add.className = 'nbtn'; add.title = 'Add child group'; add.textContent = '＋';
+      add.addEventListener('click', e => { e.stopPropagation(); promptNewGroup(id); });
+      span.appendChild(ren);
+      span.appendChild(add);
+    }
+    const del = document.createElement('button');
+    del.className = 'nbtn del'; del.title = isCC ? 'Remove from hierarchy' : 'Delete (children move up)';
+    del.textContent = '✕';
+    del.addEventListener('click', e => { e.stopPropagation(); deleteWorkNode(id); });
+    span.appendChild(del);
+    return span;
+  };
+
+  const bindDrag = (row, id, isDropTarget) => {
+    row.draggable = true;
+    row.addEventListener('dragstart', e => {
+      e.stopPropagation();
+      e.dataTransfer.setData('text/plain', id);
+      e.dataTransfer.effectAllowed = 'move';
+      row.classList.add('dragging');
+    });
+    row.addEventListener('dragend', () => row.classList.remove('dragging'));
+    if (isDropTarget) {
+      row.addEventListener('dragover', e => { e.preventDefault(); e.stopPropagation(); row.classList.add('drop-hover'); });
+      row.addEventListener('dragleave', () => row.classList.remove('drop-hover'));
+      row.addEventListener('drop', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        row.classList.remove('drop-hover');
+        const src = e.dataTransfer.getData('text/plain');
+        if (!src || src === id) return;
+        const res = moveNode(work, src, id);
+        if (!res.ok) { editFlash(res.error, true); return; }
+        if (!res.noop) changed();
+      });
+    }
+  };
+
+  const renderNode = id => {
+    const n = work.nodes[id];
+    const li = document.createElement('li');
+    const isCC = n.type === 'cc';
+    const row = document.createElement('div');
+    let cls = 'node ' + n.type;
+    if (addedSet.has(id)) cls += ' added';
+    if (extraSet.has(id)) cls += ' extra';
+    row.className = cls;
+
+    if (isCC || !n.children.length) {
+      const cc = state.costCentres[id];
+      row.innerHTML = `<span class="caret leaf">▾</span><span class="nid">${esc(n.label)}</span>` +
+        (n.name ? `<span class="nname">${esc(n.name)}</span>` : '') +
+        (cc && cc.responsible ? `<span class="nresp">${esc(cc.responsible)}</span>` : '');
+    } else {
+      row.innerHTML = `<span class="caret">▾</span><span class="nid">${esc(n.label)}</span>` +
+        (n.name ? `<span class="nname">${esc(n.name)}</span>` : '') +
+        `<span class="ncount">(${ccCountUnder(work, id, memo)} cc)</span>`;
+      row.querySelector('.caret').addEventListener('click', () => li.classList.toggle('collapsed'));
+    }
+    row.appendChild(makeButtons(id, isCC));
+    bindDrag(row, id, !isCC);
+    li.appendChild(row);
+    if (!isCC && n.children.length) {
+      const ul = document.createElement('ul');
+      n.children.forEach(c => ul.appendChild(renderNode(c)));
+      li.appendChild(ul);
+    }
+    return li;
+  };
+
+  const ul = document.createElement('ul');
+  ul.className = 'tree';
+  work.roots.forEach(r => ul.appendChild(renderNode(r)));
+  container.appendChild(ul);
+}
+
+function renderEditTable(table, work, addedSet, extraSet) {
+  const groups = groupOptions(work);
+  let html = '<thead><tr><th>Node</th><th>Name</th><th>Type</th><th>Parent</th><th>Person responsible</th><th>Actions</th></tr></thead><tbody>';
+  const rows = [];
+  const walk = (id, depth) => {
+    rows.push({ id, depth });
+    work.nodes[id].children.forEach(c => walk(c, depth + 1));
+  };
+  work.roots.forEach(r => walk(r, 0));
+
+  for (const { id, depth } of rows) {
+    const n = work.nodes[id];
+    const isCC = n.type === 'cc';
+    const cc = state.costCentres[id];
+    const parentOpts = ['<option value="">(root)</option>'].concat(groups
+      .filter(g => g.id !== id && !isInSubtree(work, id, g.id))
+      .map(g => `<option value="${esc(g.id)}" ${g.id === n.parent ? 'selected' : ''}>${'\u00a0\u00a0'.repeat(g.depth)}${esc(g.label)}</option>`))
+      .join('');
+    let rowCls = '';
+    if (addedSet.has(id)) rowCls = 'row-added';
+    else if (extraSet.has(id)) rowCls = 'row-extra';
+    html += `<tr class="${rowCls}">
+      <td class="mono"><span class="indent">${'│ '.repeat(depth)}</span>${esc(n.label)}</td>
+      <td>${isCC
+        ? esc(n.name)
+        : `<input type="text" data-name="${esc(id)}" value="${esc(n.name)}">`}</td>
+      <td>${isCC ? 'Cost centre' : 'Group'}</td>
+      <td><select data-parent="${esc(id)}">${parentOpts}</select></td>
+      <td>${esc(cc ? cc.responsible : '')}</td>
+      <td><div class="inline-form">
+        ${isCC ? '' : `<button class="small ghost" data-addchild="${esc(id)}">＋ child</button>`}
+        <button class="small ghost danger" data-delnode="${esc(id)}">✕</button>
+      </div></td>
+    </tr>`;
+  }
+  html += '</tbody>';
+  table.innerHTML = html;
+
+  table.querySelectorAll('input[data-name]').forEach(inp => inp.addEventListener('change', () => {
+    renameNode(work, inp.dataset.name, inp.value);
+    changed();
+  }));
+  table.querySelectorAll('select[data-parent]').forEach(sel => sel.addEventListener('change', () => {
+    const res = moveNode(work, sel.dataset.parent, sel.value || null);
+    if (!res.ok) { editFlash(res.error, true); renderEditor(); return; }
+    changed();
+  }));
+  table.querySelectorAll('[data-addchild]').forEach(btn => btn.addEventListener('click', () => promptNewGroup(btn.dataset.addchild)));
+  table.querySelectorAll('[data-delnode]').forEach(btn => btn.addEventListener('click', () => deleteWorkNode(btn.dataset.delnode)));
+}
+
+function renderEditor() {
+  const work = state.work;
+  document.querySelectorAll('.subtab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.view === state.editView));
+  const treeEl = $('#editTree');
+  const tableWrap = $('#editTableWrap');
+  treeEl.hidden = state.editView !== 'tree';
+  tableWrap.hidden = state.editView !== 'table';
+
+  if (!work) {
+    editFlash('');
+    treeEl.innerHTML = '<p class="muted">Upload a to-be (target) hierarchy file in tab 3 to start editing.</p>';
+    treeEl.hidden = false;
+    tableWrap.hidden = true;
+    $('#editTable').innerHTML = '';
+    return;
+  }
+
+  const chk = computeCheck();
+  const addedSet = addedSetOf();
+  const extraSet = chk.proj ? new Set(chk.extras) : new Set();
+  renderEditTree(treeEl, work, addedSet, extraSet);
+  renderEditTable($('#editTable'), work, addedSet, extraSet);
 }
 
 /* ============================================================ wiring */
@@ -1021,6 +1480,12 @@ function loadKS13File(file) {
   });
 }
 
+function adoptTargetTree(tree) {
+  state.hier.target = tree;
+  state.work = deepCopyTree(tree);
+  state.recs = {};
+}
+
 function loadHierFile(slot, file) {
   readFileSmart(file, text => {
     const tree = parseHierarchy(text, state.hierFormatChoice[slot]);
@@ -1030,8 +1495,8 @@ function loadHierFile(slot, file) {
     }
     tree.fileName = file.name;
     tree.sourceText = text; // kept so a format change can re-parse
-    state.hier[slot] = tree;
-    if (slot === 'target') state.assignments = {};
+    if (slot === 'target') adoptTargetTree(tree);
+    else state.hier.current = tree;
     changed();
   });
 }
@@ -1083,27 +1548,69 @@ function init() {
         if (tree) {
           tree.fileName = old.fileName;
           tree.sourceText = old.sourceText;
-          state.hier[slot] = tree;
-          if (slot === 'target') state.assignments = {};
+          if (slot === 'target') {
+            if (!confirm('Re-parsing the target file discards all edits and approvals. Continue?')) {
+              renderHier(slot);
+              return;
+            }
+            adoptTargetTree(tree);
+          } else {
+            state.hier.current = tree;
+          }
         }
       }
       changed();
     });
   }
 
-  // check
+  // check & approvals
   $('#checkProject').addEventListener('change', e => {
     state.targetProjectId = e.target.value ? +e.target.value : null;
     changed();
   });
+  $('#approveAllBtn').addEventListener('click', () => {
+    const chk = computeCheck();
+    let n = 0;
+    for (const cc of chk.missing) {
+      const top = computeSuggestions(cc.key)[0];
+      if (top && approveRec(cc.key, top.id, false).ok) n++;
+    }
+    if (n) changed();
+    if (n < chk.missing.length) {
+      alert(`${chk.missing.length - n} cost centre(s) have no recommendation and need a manual placement.`);
+    }
+  });
+
+  // editor
+  document.querySelectorAll('.subtab-btn').forEach(btn => btn.addEventListener('click', () => {
+    state.editView = btn.dataset.view;
+    scheduleSave();
+    renderEditor();
+  }));
+  $('#addRootBtn').addEventListener('click', () => {
+    if (!state.work) { editFlash('Upload a target file first (tab 3).', true); return; }
+    promptNewGroup(null);
+  });
+  $('#resetEditsBtn').addEventListener('click', () => {
+    if (!state.hier.target) return;
+    if (!confirm('Discard all edits and approvals and reload the working copy from the uploaded target file?')) return;
+    state.work = deepCopyTree(state.hier.target);
+    state.recs = {};
+    changed();
+  });
+
+  // exports
+  $('#expNodes').addEventListener('click', exportNodeChanges);
+  $('#expCCs').addEventListener('click', exportCCChanges);
   $('#expPC').addEventListener('click', exportParentChild);
   $('#expLevel').addEventListener('click', exportLevels);
   $('#expReport').addEventListener('click', exportReport);
 
   // reset
   $('#resetBtn').addEventListener('click', () => {
-    if (!confirm('Clear all loaded data, projects and assignments stored in this browser?')) return;
+    if (!confirm('Clear all loaded data, projects, edits and approvals stored in this browser?')) return;
     localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(STORAGE_KEY_V1);
     location.reload();
   });
 
@@ -1116,7 +1623,9 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     state, normKey, normResp, parseDelimited, splitQuoted, guessMapping, parseKS13,
     buildCostCentres, detectFormat, buildParentChild, buildLevel, classifyTree,
-    groupOptions, computeCheck, computeSuggestions, toCSV,
+    groupOptions, computeCheck, computeSuggestions, toCSV, deepCopyTree,
+    isInSubtree, moveNode, renameNode, addGroup, deleteNodePromote, removeCCNode,
+    approveRec, undoApproval, rejectRec, reconsiderRec, diffChanges,
   };
 }
 

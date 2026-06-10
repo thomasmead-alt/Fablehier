@@ -22,7 +22,8 @@
   <button class="tab-btn active" data-tab="tab-data">1 &middot; KS13 master data</button>
   <button class="tab-btn" data-tab="tab-projects">2 &middot; Projects</button>
   <button class="tab-btn" data-tab="tab-hier">3 &middot; Hierarchies</button>
-  <button class="tab-btn" data-tab="tab-check">4 &middot; Completeness &amp; assign</button>
+  <button class="tab-btn" data-tab="tab-check">4 &middot; Completeness &amp; approvals</button>
+  <button class="tab-btn" data-tab="tab-edit">5 &middot; Edit &amp; export</button>
 </nav>
 
 <main>
@@ -98,7 +99,8 @@
 
     <div class="card drop" id="tgtDrop">
       <h2>To-be hierarchy (target)</h2>
-      <p class="hint">The target hierarchy for <strong>one project group</strong>. Level-based or parent&ndash;child file.</p>
+      <p class="hint">The target hierarchy for <strong>one project group</strong>. Level-based or parent&ndash;child file.
+        Loading a file (re)creates the editable working copy in tab 5; this panel always shows the file as uploaded.</p>
       <div class="inline-form">
         <input type="file" id="tgtFile" accept=".txt,.csv,.tsv,.dat,text/*">
         <label>Format <select id="tgtFormat">
@@ -113,7 +115,7 @@
   </div>
 </section>
 
-<!-- ============ 4. Completeness ============ -->
+<!-- ============ 4. Completeness & approvals ============ -->
 <section id="tab-check" class="tab">
   <div class="card">
     <h2>Completeness check</h2>
@@ -127,16 +129,27 @@
   </div>
 
   <div class="card" id="missingCard" hidden>
-    <h2>Missing cost centres <span class="badge red" id="missingCount"></span></h2>
-    <p class="hint">Cost centres of the selected project that are <strong>not</strong> in the target file.
-      The hierarchy is organisational, so suggestions place each cost centre next to the other cost centres of the
-      same person responsible (and, as a secondary signal, next to its former as-is neighbours).</p>
+    <h2>Missing cost centres &mdash; recommendations <span class="badge red" id="missingCount"></span></h2>
+    <p class="hint">Cost centres of the selected project that are <strong>not</strong> in the to-be hierarchy.
+      The hierarchy is organisational, so each recommendation places the cost centre next to the other cost centres
+      of the same person responsible (former as-is neighbours act as a secondary signal).
+      Approve the recommendation, override the parent first, or reject it.</p>
+    <div class="inline-form">
+      <button id="approveAllBtn" class="small">Approve all recommendations</button>
+    </div>
     <div class="table-wrap"><table id="missingTable"></table></div>
   </div>
 
-  <div class="card" id="assignedCard" hidden>
-    <h2>Assigned in this session <span class="badge green" id="assignedCount"></span></h2>
-    <div class="table-wrap"><table id="assignedTable"></table></div>
+  <div class="card" id="approvedCard" hidden>
+    <h2>Approved placements <span class="badge green" id="approvedCount"></span></h2>
+    <p class="hint">Applied to the working hierarchy in tab 5. Undo returns the cost centre to the recommendation list.</p>
+    <div class="table-wrap"><table id="approvedTable"></table></div>
+  </div>
+
+  <div class="card" id="rejectedCard" hidden>
+    <h2>Rejected recommendations <span class="badge grey" id="rejectedCount"></span></h2>
+    <p class="hint">These cost centres stay <strong>missing</strong> from the to-be hierarchy but are marked as reviewed.</p>
+    <div class="table-wrap"><table id="rejectedTable"></table></div>
   </div>
 
   <div class="card" id="extraCard" hidden>
@@ -144,22 +157,48 @@
     <div id="extraBody"></div>
   </div>
 
-  <div class="card" id="updatedCard" hidden>
-    <h2>Updated target hierarchy</h2>
-    <p class="hint"><span class="swatch added"></span> added in this session &nbsp;
-       <span class="swatch extra"></span> in target file but not part of the selected project</p>
-    <div id="updatedTree" class="tree-wrap"></div>
-    <div class="inline-form">
-      <button id="expPC">Export hierarchy (parent&ndash;child CSV)</button>
-      <button id="expLevel">Export hierarchy (level-based CSV)</button>
-      <button id="expReport" class="ghost">Export completeness report (CSV)</button>
-    </div>
-  </div>
-
   <div class="card" id="compareCard" hidden>
     <h2>As-is vs to-be comparison</h2>
-    <p class="hint">Where each cost centre of the project sits today versus in the target file.</p>
+    <p class="hint">Where each cost centre of the project sits today versus in the edited to-be hierarchy.</p>
     <div class="table-wrap"><table id="compareTable"></table></div>
+  </div>
+</section>
+
+<!-- ============ 5. Edit & export ============ -->
+<section id="tab-edit" class="tab">
+  <div class="card">
+    <h2>Edit the to-be hierarchy</h2>
+    <p class="hint" id="editHint">Both views edit the <strong>same working copy</strong> and stay in sync.
+      Live view: drag a node onto a group to move it; use the row buttons to rename (&#9998;), add a child group (&#65291;)
+      or delete (&#10005;). Deleting a group moves its children up one level; deleting a cost centre returns it to the
+      missing list. Table view: edit names and change parents inline.</p>
+    <div class="subtabs">
+      <button class="subtab-btn active" data-view="tree">Live view</button>
+      <button class="subtab-btn" data-view="table">Table view</button>
+      <span class="spacer"></span>
+      <button id="addRootBtn" class="small ghost">Add root group</button>
+      <button id="resetEditsBtn" class="small ghost danger">Discard edits (reload from file)</button>
+    </div>
+    <p class="hint"><span class="swatch added"></span> added vs the uploaded target file &nbsp;
+       <span class="swatch extra"></span> cost centre not in the selected project</p>
+    <div id="editMsg" class="msg"></div>
+    <div id="editTree" class="tree-wrap"></div>
+    <div id="editTableWrap" class="table-wrap" hidden><table id="editTable"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Export</h2>
+    <p class="hint">Change files list every create / update / delete needed to turn the uploaded target file
+      into the edited to-be hierarchy &mdash; hierarchy nodes and cost centres separately.</p>
+    <div class="inline-form">
+      <button id="expNodes">Export node changes (CSV)</button>
+      <button id="expCCs">Export cost centre changes (CSV)</button>
+    </div>
+    <div class="inline-form">
+      <button id="expPC" class="ghost">Full hierarchy (parent&ndash;child CSV)</button>
+      <button id="expLevel" class="ghost">Full hierarchy (level-based CSV)</button>
+      <button id="expReport" class="ghost">Completeness report (CSV)</button>
+    </div>
   </div>
 </section>
 

@@ -212,4 +212,53 @@ li.collapsed > .node .caret { transform: rotate(-90deg); }
 .suggestion { font-size: 12.5px; }
 .suggestion .why { color: var(--muted); }
 
+/* sub-tabs (editor views) */
+.subtabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 8px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+.subtabs .spacer { flex: 1; }
+.subtab-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 5px 12px;
+}
+.subtab-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* editable tree */
+.node .nbtns { visibility: hidden; display: inline-flex; gap: 2px; margin-left: 4px; }
+.node:hover .nbtns { visibility: visible; }
+.nbtn {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+.nbtn:hover { background: var(--accent-soft); color: var(--accent); filter: none; }
+.nbtn.del:hover { background: var(--red-soft); color: var(--red); }
+.node[draggable="true"] { cursor: grab; }
+.node.drop-hover { outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-soft); }
+.node.dragging { opacity: .4; }
+
+/* editable table */
+#editTable input[type="text"] { width: 100%; min-width: 140px; padding: 4px 6px; }
+#editTable select { max-width: 260px; }
+#editTable .indent { color: var(--border); }
+tr.row-added td { background: var(--green-soft); }
+tr.row-extra td { background: var(--amber-soft); }
+
 footer { padding: 14px 24px; text-align: center; }

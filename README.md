@@ -29,6 +29,8 @@ Upload two hierarchy files:
 
 - **As-is (current)** — the hierarchy as it stands today.
 - **To-be (target)** — the target hierarchy, representing **one** project group.
+  Loading it creates an **editable working copy** (tab 5); this panel always shows the
+  file exactly as uploaded.
 
 Both accept either format (auto-detected, overridable):
 
@@ -40,25 +42,50 @@ Both accept either format (auto-detected, overridable):
 IDs are matched across files case-insensitively, and leading zeros on numeric IDs are
 ignored (`0000410100` ≡ `410100`). Multiple parents and cycles are rejected with warnings.
 
-### 4 · Completeness & assign
-Select which project the target file represents. The app then checks the target file for
-completeness:
+### 4 · Completeness & approvals
+Select which project the target file represents. The app checks the working to-be
+hierarchy for completeness:
 
-- **Missing** — cost centres of the project that are *not* in the target file, highlighted
-  in red. Because the hierarchy is organisational, the app suggests a parent node for each
-  one using the **person responsible** from KS13: nodes already holding that person's other
-  cost centres score highest, with the cost centre's former as-is neighbours as a secondary
-  signal. Accept the suggestion or pick any node, then *Assign*.
-- **Extras** — cost centres in the target file that belong to a different project (or to no
-  project), flagged for review.
-- **Unknown entries** — leaf entries in the target file that don't exist in KS13 at all
-  (typos, retired cost centres or empty groups).
+- **Missing — recommendations**: cost centres of the project that are *not* in the to-be
+  hierarchy, highlighted in red. Because the hierarchy is organisational, each gets a
+  **recommended parent** based on the **person responsible** from KS13 (nodes already
+  holding that person's other cost centres score highest; former as-is neighbours are a
+  secondary signal). Each recommendation goes through an **approval flow**:
+  - **Approve** — applies the placement to the working hierarchy (override the parent
+    first for a manual placement). *Approve all recommendations* processes the whole list.
+  - **Reject** — the cost centre stays missing but is marked as reviewed; it can be
+    reconsidered later.
+  - Approved placements can be undone, returning the cost centre to the list.
+  Approved placements reinforce later recommendations for the same person responsible.
+- **Extras** — cost centres in the to-be hierarchy that belong to a different project.
+- **Unknown entries** — leaf entries that don't exist in KS13 at all.
 - **As-is vs to-be comparison** — where each project cost centre sits today versus in the
-  target, including moves and session assignments.
+  edited to-be hierarchy (moved / same parent / added / missing / rejected).
 
-Exports (CSV, Excel-friendly): the updated hierarchy as **parent–child** or **level-based**
-(with session assignments marked `added`), and a **completeness report** listing every cost
-centre with its status (`OK` / `MISSING` / `ASSIGNED` / `EXTRA` / `UNKNOWN`).
+### 5 · Edit & export
+The working to-be hierarchy is fully editable in two linked views of the **same working
+copy** — switching tabs never loses changes:
+
+- **Live view** (tree): drag a node onto a group to move it; row buttons rename (✎),
+  add a child group (＋) and delete (✕). Deleting a group promotes its children one
+  level up; deleting a cost centre returns it to the missing list. Moves that would
+  create a cycle or place nodes under a cost centre are blocked.
+- **Table view**: one row per node in hierarchy order — edit names inline and change a
+  node's parent from a dropdown (own descendants are excluded automatically).
+
+Additions versus the uploaded file are highlighted green; cost centres outside the
+selected project amber. *Discard edits* reloads the working copy from the uploaded file.
+
+**Exports** (CSV with UTF-8 BOM, Excel-friendly):
+
+- **Node changes** — every `CREATE` / `MOVE` / `RENAME` / `MOVE+RENAME` / `DELETE` needed
+  to turn the uploaded target file into the edited hierarchy, with old/new name and parent.
+- **Cost centre changes** — every `ADD` / `MOVE` / `REMOVE`, with old/new parent, the
+  as-is parent for context, and the source of each addition (approved recommendation,
+  manual placement or editor).
+- Full hierarchy as **parent–child** or **level-based** CSV (additions marked).
+- **Completeness report** — every cost centre with its status
+  (`OK` / `ADDED` / `MISSING` / `REJECTED` / `EXTRA` / `UNKNOWN`).
 
 ## Try it with the sample files
 
@@ -69,12 +96,13 @@ In `samples/`:
 3. `current_levels.csv` — as-is hierarchy (level-based).
 4. `target_parent_child.csv` — to-be hierarchy for the Engineering project, deliberately
    missing `0000410150` and `0000420260`. The check flags both; the responsible-person
-   suggestions place them under `ENG-PLATFORM` (Anna Mueller) and `ENG-DATA` (Ben Oduya).
+   recommendations place them under `ENG-PLATFORM` (Anna Mueller) and `ENG-DATA`
+   (Ben Oduya) — approve, tweak the hierarchy in tab 5, then export the change files.
 
 ## Development
 
-The app itself has zero dependencies. The parsing/matching logic has a smoke-test suite
-that runs with nothing but Node built-ins:
+The app itself has zero dependencies. The parsing/matching/editing logic has a smoke-test
+suite that runs with nothing but Node built-ins:
 
 ```sh
 node tests/run-tests.js
@@ -82,7 +110,7 @@ node tests/run-tests.js
 
 Files:
 
-- `index.html` — page structure (4 tabs)
+- `index.html` — page structure (5 tabs)
 - `styles.css` — styling
 - `app.js` — all logic: parsing, project grouping, tree building, completeness check,
-  suggestions, exports, localStorage persistence
+  recommendation approval flow, tree editing, CRUD diff, exports, localStorage persistence
