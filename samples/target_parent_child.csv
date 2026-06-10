@@ -1,0 +1,12 @@
+Parent,Child,Name
+,ENG-ROOT,Engineering To-Be
+ENG-ROOT,ENG-PLATFORM,Platform Organisation
+ENG-ROOT,ENG-DATA,Data Organisation
+ENG-ROOT,ENG-QUALITY,Quality Organisation
+ENG-PLATFORM,0000410100,Engineering Core
+ENG-PLATFORM,0000410110,Platform Services
+ENG-PLATFORM,0000410120,Cloud Infrastructure
+ENG-DATA,0000420200,Data Engineering
+ENG-DATA,0000420210,Analytics
+ENG-QUALITY,0000420300,QA and Test
+ENG-QUALITY,0000430310,Release Management

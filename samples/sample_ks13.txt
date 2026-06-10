@@ -1,0 +1,20 @@
+Display Cost Centers: Master Data
+Controlling Area: CORP
+----------------------------------------------------------------------------------------------------
+|Cost Center|Cost Center Name      |Person Responsible|Profit Center|Hierarchy Area|Company Code|
+----------------------------------------------------------------------------------------------------
+|0000410100 |Engineering Core      |ANNA MUELLER      |P-ENG-01     |H-ENG         |1000        |
+|0000410110 |Platform Services     |ANNA MUELLER      |P-ENG-01     |H-ENG         |1000        |
+|0000410120 |Cloud Infrastructure  |ANNA MUELLER      |P-ENG-01     |H-ENG         |1000        |
+|0000410150 |DevOps Tooling        |ANNA MUELLER      |P-ENG-01     |H-ENG         |1000        |
+|0000420200 |Data Engineering      |BEN ODUYA         |P-ENG-02     |H-ENG         |1000        |
+|0000420210 |Analytics             |BEN ODUYA         |P-ENG-02     |H-ENG         |1000        |
+|0000420260 |Machine Learning      |BEN ODUYA         |P-ENG-02     |H-ENG         |1000        |
+|0000420300 |QA and Test           |CARLA SILVA       |P-ENG-02     |H-ENG         |1000        |
+|0000430310 |Release Management    |CARLA SILVA       |P-ENG-02     |H-ENG         |1000        |
+|0000510100 |Field Sales North     |DAVID KIM         |P-SAL-01     |H-SAL         |1000        |
+|0000510110 |Field Sales South     |DAVID KIM         |P-SAL-01     |H-SAL         |1000        |
+|0000510200 |Sales Operations      |ERIN COLE         |P-SAL-01     |H-SAL         |1000        |
+|0000610100 |Finance Shared Svcs   |FRANK ADLER       |P-FIN-01     |H-FIN         |1000        |
+|0000610110 |Payroll               |FRANK ADLER       |P-FIN-01     |H-FIN         |1000        |
+----------------------------------------------------------------------------------------------------

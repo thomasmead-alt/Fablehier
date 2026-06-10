@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cost Centre Hierarchy Builder</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1>Cost Centre Hierarchy Builder</h1>
+    <p>Fully local &mdash; no data leaves this browser. No libraries, no network.</p>
+  </div>
+  <div class="header-actions">
+    <span id="saveIndicator" class="muted"></span>
+    <button id="resetBtn" class="danger ghost" title="Clear all loaded data and start over">Reset all data</button>
+  </div>
+</header>
+
+<nav id="tabs">
+  <button class="tab-btn active" data-tab="tab-data">1 &middot; KS13 master data</button>
+  <button class="tab-btn" data-tab="tab-projects">2 &middot; Projects</button>
+  <button class="tab-btn" data-tab="tab-hier">3 &middot; Hierarchies</button>
+  <button class="tab-btn" data-tab="tab-check">4 &middot; Completeness &amp; assign</button>
+</nav>
+
+<main>
+
+<!-- ============ 1. KS13 ============ -->
+<section id="tab-data" class="tab active">
+  <div class="card" id="ks13Drop">
+    <h2>Upload SAP KS13 export</h2>
+    <p class="hint">Export of <em>KS13 &ndash; Display Cost Centers: Master Data</em>. Accepted formats:
+      pipe-framed SAP list (ALV), tab-separated, CSV (comma or semicolon). Drop a file here or pick one.</p>
+    <input type="file" id="ks13File" accept=".txt,.csv,.tsv,.dat,.asc,text/*">
+    <div id="ks13Msg" class="msg"></div>
+  </div>
+
+  <div class="card" id="mappingCard" hidden>
+    <h2>Column mapping</h2>
+    <p class="hint">Columns were guessed from the header row &mdash; correct them if needed.</p>
+    <div class="map-grid">
+      <label>Cost centre <select id="mapCC"></select></label>
+      <label>Name / description <select id="mapName"></select></label>
+      <label>Person responsible <select id="mapResp"></select></label>
+      <label>Profit centre <select id="mapPC"></select></label>
+    </div>
+  </div>
+
+  <div class="card" id="ks13DataCard" hidden>
+    <h2>Cost centres</h2>
+    <div id="ks13Stats" class="stats"></div>
+    <input type="search" id="ks13Search" placeholder="Filter rows&hellip;">
+    <div class="table-wrap"><table id="ks13Table"></table></div>
+  </div>
+</section>
+
+<!-- ============ 2. Projects ============ -->
+<section id="tab-projects" class="tab">
+  <div class="two-col">
+    <div class="card">
+      <h2>Projects</h2>
+      <p class="hint">Create a project for each restructuring work package, then assign profit centres to it on the right.
+        Every cost centre belongs to the project of its current profit centre.</p>
+      <div class="inline-form">
+        <input type="text" id="projNewName" placeholder="New project name&hellip;">
+        <button id="projCreateBtn">Create project</button>
+      </div>
+      <div id="projList"></div>
+    </div>
+    <div class="card">
+      <h2>Profit centres</h2>
+      <p class="hint">Current profit centres found in the KS13 file. Assign each to a project.</p>
+      <input type="search" id="pcSearch" placeholder="Filter profit centres&hellip;">
+      <div class="table-wrap"><table id="pcTable"></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 3. Hierarchies ============ -->
+<section id="tab-hier" class="tab">
+  <div class="two-col">
+    <div class="card drop" id="curDrop">
+      <h2>As-is hierarchy (current)</h2>
+      <p class="hint">The hierarchy as it stands today. Level-based or parent&ndash;child file; format is auto-detected.</p>
+      <div class="inline-form">
+        <input type="file" id="curFile" accept=".txt,.csv,.tsv,.dat,text/*">
+        <label>Format <select id="curFormat">
+          <option value="auto">Auto-detect</option>
+          <option value="parent-child">Parent / child</option>
+          <option value="level">Level-based</option>
+        </select></label>
+      </div>
+      <div id="curInfo" class="msg"></div>
+      <div id="curTree" class="tree-wrap"></div>
+    </div>
+
+    <div class="card drop" id="tgtDrop">
+      <h2>To-be hierarchy (target)</h2>
+      <p class="hint">The target hierarchy for <strong>one project group</strong>. Level-based or parent&ndash;child file.</p>
+      <div class="inline-form">
+        <input type="file" id="tgtFile" accept=".txt,.csv,.tsv,.dat,text/*">
+        <label>Format <select id="tgtFormat">
+          <option value="auto">Auto-detect</option>
+          <option value="parent-child">Parent / child</option>
+          <option value="level">Level-based</option>
+        </select></label>
+      </div>
+      <div id="tgtInfo" class="msg"></div>
+      <div id="tgtTree" class="tree-wrap"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4. Completeness ============ -->
+<section id="tab-check" class="tab">
+  <div class="card">
+    <h2>Completeness check</h2>
+    <div class="inline-form">
+      <label>The target file represents project
+        <select id="checkProject"></select>
+      </label>
+    </div>
+    <div id="checkSummary" class="chips"></div>
+    <div id="checkHint" class="msg"></div>
+  </div>
+
+  <div class="card" id="missingCard" hidden>
+    <h2>Missing cost centres <span class="badge red" id="missingCount"></span></h2>
+    <p class="hint">Cost centres of the selected project that are <strong>not</strong> in the target file.
+      The hierarchy is organisational, so suggestions place each cost centre next to the other cost centres of the
+      same person responsible (and, as a secondary signal, next to its former as-is neighbours).</p>
+    <div class="table-wrap"><table id="missingTable"></table></div>
+  </div>
+
+  <div class="card" id="assignedCard" hidden>
+    <h2>Assigned in this session <span class="badge green" id="assignedCount"></span></h2>
+    <div class="table-wrap"><table id="assignedTable"></table></div>
+  </div>
+
+  <div class="card" id="extraCard" hidden>
+    <h2>Review: unexpected entries in target file</h2>
+    <div id="extraBody"></div>
+  </div>
+
+  <div class="card" id="updatedCard" hidden>
+    <h2>Updated target hierarchy</h2>
+    <p class="hint"><span class="swatch added"></span> added in this session &nbsp;
+       <span class="swatch extra"></span> in target file but not part of the selected project</p>
+    <div id="updatedTree" class="tree-wrap"></div>
+    <div class="inline-form">
+      <button id="expPC">Export hierarchy (parent&ndash;child CSV)</button>
+      <button id="expLevel">Export hierarchy (level-based CSV)</button>
+      <button id="expReport" class="ghost">Export completeness report (CSV)</button>
+    </div>
+  </div>
+
+  <div class="card" id="compareCard" hidden>
+    <h2>As-is vs to-be comparison</h2>
+    <p class="hint">Where each cost centre of the project sits today versus in the target file.</p>
+    <div class="table-wrap"><table id="compareTable"></table></div>
+  </div>
+</section>
+
+</main>
+
+<footer class="muted">Everything is processed and stored locally (browser localStorage). Use <em>Reset all data</em> to wipe it.</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
